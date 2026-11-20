@@ -96,25 +96,37 @@ class CatchupStore:
         cronjob_uid: str,
         scheduled_at: str,
         job_name: str,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], bool]:
+        """落一条 creating 记录，返回 (record, inserted)。
+
+        同轮已有记录（并发/重试/重启/多实例）时不重复插入，
+        返回 (existing, False)，交由上层按记录状态查回。
+        """
         now = _utcnow_iso()
         with self._lock:
-            # 已有同轮记录（并发/重试/重启）：直接返回，交由上层查回
             existing = self.get_by_round(cronjob_uid, scheduled_at)
             if existing is not None:
-                return existing
-            cur = self._conn.execute(
-                """
-                INSERT INTO catchup_records
-                  (namespace, cronjob_name, cronjob_uid, scheduled_at,
-                   job_name, source, state, detail, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (namespace, cronjob_name, cronjob_uid, scheduled_at,
-                 job_name, SOURCE_CATCHUP, STATE_CREATING, None, now, now),
-            )
-            self._conn.commit()
-            return self.get_by_round(cronjob_uid, scheduled_at)  # type: ignore[return-value]
+                return existing, False
+            try:
+                self._conn.execute(
+                    """
+                    INSERT INTO catchup_records
+                      (namespace, cronjob_name, cronjob_uid, scheduled_at,
+                       job_name, source, state, detail, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (namespace, cronjob_name, cronjob_uid, scheduled_at,
+                     job_name, SOURCE_CATCHUP, STATE_CREATING, None, now, now),
+                )
+                self._conn.commit()
+            except sqlite3.IntegrityError:
+                # 跨进程并发：另一实例抢先插入同轮记录
+                self._conn.rollback()
+                existing = self.get_by_round(cronjob_uid, scheduled_at)
+                if existing is not None:
+                    return existing, False
+                raise
+            return self.get_by_round(cronjob_uid, scheduled_at), True  # type: ignore[return-value]
 
     def update_state(
         self, record_id: int, state: str, detail: str | None = None,

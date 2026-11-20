@@ -19,21 +19,31 @@ async def _windowed_at(harness, cj: str = NY_CJ) -> tuple[str, str]:
 
 
 def _patch_kube_verify_failure(kube):
-    """在实例上打补丁：创建超时 + 回查全失败。返回恢复函数。"""
+    """在实例上打补丁：创建超时 + 创建之后的回查全失败。返回恢复函数。
+
+    创建前的列查保持正常（否则服务按“查不清是否已有 Job”直接报待核实，
+    走不到创建这一步——该场景由 test_round_pinning 单独覆盖）。
+    """
     from app.kube import KubeError
 
+    state = {"create_attempted": False}
+    real_list = kube.list_jobs
+
     async def boom_create(namespace, manifest):
+        state["create_attempted"] = True
         raise KubeError("Kubernetes API 请求超时: 模拟")
 
     async def boom_get_job(namespace, name):
         raise KubeError("模拟回查网络故障")
 
-    async def boom_list_jobs(namespace):
-        raise KubeError("模拟回查网络故障")
+    async def flaky_list(namespace):
+        if state["create_attempted"]:
+            raise KubeError("模拟回查网络故障")
+        return await real_list(namespace)
 
     kube.create_job = boom_create
     kube.get_job = boom_get_job
-    kube.list_jobs = boom_list_jobs
+    kube.list_jobs = flaky_list
 
     def restore():
         del kube.create_job

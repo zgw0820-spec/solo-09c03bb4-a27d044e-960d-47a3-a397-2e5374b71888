@@ -252,6 +252,21 @@ def create_mock_app(state: dict | None = None) -> FastAPI:
         app.state.store = seed_state()
         return {"reset": True}
 
+    @app.post("/_mock/cronjobs/{namespace}/{name}/reschedule")
+    async def reschedule_cronjob(
+        namespace: str, name: str,
+        schedule: str | None = None, suspend: bool | None = None,
+    ):
+        """演练辅助：修改种子 CronJob 的排程/暂停状态（模拟 CronJob 被改排程）。"""
+        obj = app.state.store["cronjobs"].get((namespace, name))
+        if obj is None:
+            return _status(404, "NotFound", f"cronjobs {name} not found")
+        if schedule is not None:
+            obj["spec"]["schedule"] = schedule
+        if suspend is not None:
+            obj["spec"]["suspend"] = suspend
+        return {"updated": True, "spec": copy.deepcopy(obj["spec"])}
+
     return app
 
 

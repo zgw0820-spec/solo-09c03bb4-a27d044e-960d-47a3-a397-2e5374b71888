@@ -16,17 +16,25 @@
    - 兼容 Kubernetes 1.32 的新注解 `batch.kubernetes.io/cronjob-uid` / `job-name`，
      也兼容旧的 `kubernetes.io/controller-uid` / `scheduled-at`；
    - 原调度器创建的 Job 与本服务补建的 Job 一视同仁。
-3. **补跑**
-   - 已有 Job：原样返回，不重复创建；
-   - 仅当 **CronJob 仍处于暂停** 且 **到点后 2 小时内（按 UTC）** 才按 `jobTemplate` 补建 Job；
-   - 同轮（同 CronJob + 同计划时刻）并发只允许建一个（进程内异步锁 + SQLite 唯一约束双保险）；
+3. **轮次锁定（`/catchup`、`/reverify`）**
+   - 调用方可把查计划返回的 `cronjob_uid` 与 `scheduled_at_utc` 作为
+     `cronjob_uid` / `scheduled_at` 参数回传，锁定要处理的轮次；
+     **两项须一起提供**，省略时沿用最近一轮（`at` 仍表示演练当前时间）；
+   - 指定轮次后先查台账与集群：**找到匹配 Job 即返回**，即使已过期、
+     服务重启或 CronJob 已改排程；
+   - 确认该轮没有 Job 后，仅当 **原 CronJob 仍暂停**、**所选时刻仍符合当前排程**、
+     **已到点** 且 **到点后 2 小时内（UTC）** 才按 `jobTemplate` 补建 Job；
+   - **查不清是否已有 Job 时报 `pending_verification`**，绝不盲目补建；
+   - 所传 UID 与当前 CronJob 不一致（对象已删除重建）时拒绝补建。
+4. **补跑可靠性**
+   - 同轮（同 CronJob UID + 同计划时刻）并发只允许建一个（进程内异步锁 + SQLite 唯一约束双保险）；
    - 补建 Job 带 `inspection.example.com/catchup=true` 标签和 UID/计划时刻注解。
-4. **超时与可靠性**
-   - 创建请求回包超时：先按 Job 名回查，再按 (UID, 计划时刻) 列查；
+5. **超时与可靠性**
+   - 创建请求回包超时：先按 Job 名回查，再按 (UID, 计划时刻) 列查，**始终按原轮次核实**；
    - 回查能确认 → 正常返回创建结果；查不清 → 返回 `pending_verification`（HTTP 200），提示人工核实；
    - 补跑台账持久化在 SQLite，**进程重启后**创建到一半的记录自动转为待核实，可通过 `/reverify` 查回；
    - 超过 2 小时补跑期限后，计划与历史 Job/台账仍可查询，只是不能再新建。
-5. **演练支持**：所有接口支持 `at` 查询参数（ISO 8601，可带时区），在 Swagger 上即可指定演练时间。
+6. **演练支持**：所有接口支持 `at` 查询参数（ISO 8601，可带时区），在 Swagger 上即可指定演练时间。
 
 ## 目录结构
 
@@ -94,6 +102,45 @@ curl -X POST "http://localhost:8080/namespaces/default/cronjobs/inspection-ny/re
 curl "http://localhost:8080/records"
 ```
 
+## 跨日提交与回查演练（Swagger / curl 均可）
+
+事故场景：值班员发现 **11-20 那轮**漏跑，**11-21 才提交**。修复前服务只按 `at`
+算“最近一轮”，会建出 11-21（当天）的 Job；现在把查计划返回的
+`cronjob_uid` + `scheduled_at_utc` 回传即可锁定旧轮。
+
+```bash
+# 1) 查 11-20 当天的计划，拿到 cronjob_uid 与 scheduled_at_utc
+curl "http://localhost:8080/namespaces/default/cronjobs/inspection-daily/latest-schedule?at=2026-11-20T01:30:00Z"
+#   -> cronjob_uid=cronjob-…  scheduled_at_utc=2026-11-20T01:00:00Z（该轮已有调度器 Job）
+
+# 2) 隔天提交：带上两个返回值 + 当前演练时间 at=2026-11-21T02:00:00Z
+curl -X POST "http://localhost:8080/namespaces/default/cronjobs/inspection-daily/catchup" \
+  --data-urlencode "at=2026-11-21T02:00:00Z" \
+  --data-urlencode "cronjob_uid=<第1步的 cronjob_uid>" \
+  --data-urlencode "scheduled_at=2026-11-20T01:00:00Z" -G
+#   -> returned_existing：返回 11-20 那轮的 Job（即使已过期也不重复创建）
+#   对比：省略这两个参数 -> 按最近一轮处理，会建出 11-21（当天）的 Job，即修复前的事故行为
+
+# 3) 过期拒绝：inspection-utc（UTC 00:30，无预置 Job）指定前天轮次
+curl -X POST "http://localhost:8080/namespaces/default/cronjobs/inspection-utc/catchup" \
+  --data-urlencode "at=2026-11-20T02:00:00Z" \
+  --data-urlencode "cronjob_uid=<inspection-utc 的 uid>" \
+  --data-urlencode "scheduled_at=2026-11-19T00:30:00Z" -G
+#   -> 409 已超过补跑期限
+
+# 4) 按指定轮次回查（无台账记录时也会直接查集群）
+curl -X POST "http://localhost:8080/namespaces/default/cronjobs/inspection-daily/reverify" \
+  --data-urlencode "cronjob_uid=<第1步的 cronjob_uid>" \
+  --data-urlencode "scheduled_at=2026-11-20T01:00:00Z" -G
+#   -> returned_existing：回查指向 11-20 那轮，而不是当天
+
+# 5)（可选）模拟 CronJob 改排程：旧轮次不再符合排程 -> 拒绝补建，但已有 Job 仍可查回
+curl -X POST "http://localhost:8001/_mock/cronjobs/default/inspection-utc/reschedule?schedule=45%200%20*%20*%20*"
+```
+
+在 Swagger（<http://localhost:8080/docs>）上操作：`POST …/catchup` /
+`POST …/reverify` 的 `cronjob_uid`、`scheduled_at` 两个查询参数留空即沿用最近一轮。
+
 ## 测试
 
 ```bash
@@ -101,7 +148,8 @@ pytest
 ```
 
 覆盖：cron 解析与 DST（纽约/柏林/上海/东京）、已有 Job 直接返回、补建成功、
-暂停/窗口/时区/非每日表达式拦截、5 路并发只建一个、创建超时回查、查不清待核实、重启恢复查回。
+暂停/窗口/时区/非每日表达式拦截、5 路并发只建一个、创建超时回查、查不清待核实、重启恢复查回、
+轮次锁定（跨日查回旧轮、过期/未到点/改排程/UID 不符拒绝、参数必须成对、指定轮次并发与超时回查）。
 
 ## 已知边界 / 未完成项
 

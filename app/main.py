@@ -54,7 +54,10 @@ def create_app() -> FastAPI:
             "针对检修期间暂停的 CronJob（batch/v1，Kubernetes 1.32+），\n"
             "- 查询设有时区、每天固定时刻的 CronJob 最近一次应到点的计划；\n"
             "- 按 CronJob UID + 计划时刻匹配已有 Job（原调度器创建的也算）；\n"
-            "- 仅在 CronJob 仍暂停且到点后 2 小时内（UTC）按 jobTemplate 补建 Job；\n"
+            "- 补跑/回查可传入查计划返回的 `cronjob_uid` 与 `scheduled_at` 锁定轮次"
+            "（两项须一起提供，省略时沿用最近一轮）；\n"
+            "- 仅在 CronJob 仍暂停、所选时刻仍符合当前排程、已到点且 2 小时内（UTC）"
+            "才按 jobTemplate 补建 Job；\n"
             "- 创建回包超时先回查集群，查不清报“待核实”，重启后仍可查回。\n\n"
             "所有接口支持 `at` 参数（ISO8601）指定演练时间，缺省为当前 UTC。"
         ),
@@ -93,7 +96,7 @@ def create_app() -> FastAPI:
         "/namespaces/{namespace}/cronjobs/{name}/catchup",
         response_model=CatchupResponse,
         tags=["巡检"],
-        summary="按最近一轮计划补跑（有 Job 则原样返回）",
+        summary="补跑指定一轮计划（默认最近一轮；有 Job 则原样返回）",
     )
     async def catchup(
         namespace: str,
@@ -101,10 +104,24 @@ def create_app() -> FastAPI:
         at: datetime | None = Query(
             None, description="演练时间（ISO8601，可带时区；缺省当前 UTC）"
         ),
+        cronjob_uid: str | None = Query(
+            None,
+            description="查计划接口返回的 cronjob_uid；须与 scheduled_at 一起提供，"
+                        "省略时按最近一轮处理",
+        ),
+        scheduled_at: datetime | None = Query(
+            None,
+            description="查计划接口返回的 scheduled_at_utc（ISO8601，UTC）；"
+                        "须与 cronjob_uid 一起提供",
+        ),
     ) -> Any:
         now = parse_rehearsal_time(at)
         try:
-            return await svc().catchup(namespace, name, now)
+            return await svc().catchup(
+                namespace, name, now,
+                cronjob_uid=cronjob_uid or None,
+                scheduled_at=scheduled_at,
+            )
         except ServiceError as e:
             raise HTTPException(status_code=e.status_code, detail=e.message)
         except CronError as e:
@@ -116,16 +133,30 @@ def create_app() -> FastAPI:
         "/namespaces/{namespace}/cronjobs/{name}/reverify",
         response_model=CatchupResponse,
         tags=["巡检"],
-        summary="对“待核实”的补跑记录重新回查集群",
+        summary="按轮次回查集群（默认最近一轮；用于“待核实”记录）",
     )
     async def reverify(
         namespace: str,
         name: str,
         at: datetime | None = Query(None, description="演练时间（ISO8601）"),
+        cronjob_uid: str | None = Query(
+            None,
+            description="查计划接口返回的 cronjob_uid；须与 scheduled_at 一起提供，"
+                        "省略时按最近一轮处理",
+        ),
+        scheduled_at: datetime | None = Query(
+            None,
+            description="查计划接口返回的 scheduled_at_utc（ISO8601，UTC）；"
+                        "须与 cronjob_uid 一起提供",
+        ),
     ) -> Any:
         now = parse_rehearsal_time(at)
         try:
-            return await svc().reverify(namespace, name, now)
+            return await svc().reverify(
+                namespace, name, now,
+                cronjob_uid=cronjob_uid or None,
+                scheduled_at=scheduled_at,
+            )
         except ServiceError as e:
             raise HTTPException(status_code=e.status_code, detail=e.message)
         except CronError as e:
